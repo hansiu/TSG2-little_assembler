@@ -1,0 +1,227 @@
+#!/usr/bin/env python
+# import timing # this was for me, an additional script that printed timing.
+import sys
+import matplotlib
+matplotlib.use('agg')
+import matplotlib.pyplot as plt
+import numpy as np
+import scipy.signal as ss
+
+def read_fasta(fastafile):
+    reads = []
+    for line in fastafile:
+        if line[0] != '>':
+            reads.append(line.rstrip())  # we dont rid of duplicates here, because they may be important for kmer hist
+    return list(reads)
+
+# Error correction ----------------------------------------------
+def neighbors1mm(kmer, alpha):
+    ''' Generate all neighbors at Hamming distance 1 from kmer '''
+    neighbors = []
+    for j in range(len(kmer)-1, -1, -1):
+        oldc = kmer[j]
+        for c in alpha:
+            if c == oldc: continue
+            neighbors.append(kmer[:j] + c + kmer[j+1:])
+    return neighbors
+
+
+def kmerHist(reads, k):
+    ''' Return k-mer histogram and average # k-mer occurrences
+    - modified to return the reads mapping to kmers. '''
+    kmerhist = {}
+    for e, read in enumerate(reads):
+        for kmer in [read[i:i + k] for i in range(len(read) - (k - 1))]:
+            if not kmer in kmerhist:
+                kmerhist[kmer] = []
+            kmerhist[kmer].append(e)  # add read to those containing kmer
+    return kmerhist
+
+
+def hist2distr(khist, pngname=None):
+    vals = [len(v) for v in khist.values()]
+    m = max(vals)
+    n, b, p = plt.hist(vals, m)
+    n = np.insert(n, 0, 0)
+    if pngname is not None:
+        plt.savefig(pngname)
+    return (get_thresh(n))
+
+
+def get_thresh(N):
+    maxs = ss.argrelextrema(N, np.greater)
+    mins = ss.argrelextrema(N, np.less)
+    if mins[0].size:
+        return mins[0][0]
+    elif maxs[0][0] == 1:
+        return 2
+    return 1
+
+
+def correct1mm(read, k, kmerhist, alpha, thresh):
+    ''' Return an error-corrected version of read.  k = k-mer length.
+        kmerhist is kmer count map.  alpha is alphabet.  thresh is
+        count threshold above which k-mer is considered correct. '''
+    # Iterate over k-mers in read
+    for i in range(len(read)-(k-1)):
+        kmer = read[i:i+k]
+        # If k-mer is infrequent...
+        if len(kmerhist.get(kmer, [])) <= thresh:
+            # Look for a frequent neighbor
+            for newkmer in neighbors1mm(kmer, alpha):
+                if len(kmerhist.get(newkmer, [])) > thresh:
+                    # Found a frequent neighbor; replace old kmer
+                    # with neighbor
+                    read = read[:i] + newkmer + read[i+k:]
+                    break
+    # Return possibly-corrected read
+    return read
+
+
+# overlapping -----------------------------------------------------------
+def suffixPrefixMatch(x, y, k):
+    ''' Return length of longest suffix of x of length at least k that
+        matches a prefix of y.  Return 0 if there no suffix/prefix
+        match has length at least k. '''
+    if len(x) < k or len(y) < k:
+        return 0
+    idx = len(y)  # start at the right end of y
+    # Search right-to-left in y for length-k suffix of x
+    while True:
+        hit = y.rfind(x[-k:], 0, idx)
+        if hit == -1:  # not found
+            return 0
+        ln = hit + k
+        # See if match can be extended to include entire prefix of y
+        if x[-ln:] == y[:ln]:
+            return ln  # return length of prefix
+        idx = hit + k - 1  # keep searching to left in Y
+
+
+def generate_overlaps(reads, khist, k):
+    overlaps = {}
+    for common_kmer_reads in list(khist.items()):  # finding seeds for overlaps - common kmers
+        for A in list(set(common_kmer_reads[1])):
+            for B in list(set(common_kmer_reads[1])):
+                if A == B or (A, B) in overlaps:
+                    continue
+                for pair in [(A, B), (B, A)]:
+                    overlaps[pair] = suffixPrefixMatch(reads[pair[0]], reads[pair[1]], k)
+
+    return overlaps
+
+
+def pick_maximal_overlap(overlaps):
+    """ Return a pair of reads from the list with a
+        maximal suffix/prefix overlap >= k.  Returns
+        overlap length 0 if there are no such overlaps."""
+    reada, readb = None, None
+    best_olen = 0
+    for pair in overlaps.keys():
+        olen = overlaps[pair]
+        if olen > best_olen:
+            reada, readb = pair[0], pair[1]
+            best_olen = olen
+
+    return reada, readb, best_olen
+
+
+def regenerate_overlaps(overlaps, r1, r2, j, reads, khist, k):
+    new_reads_overlaps = set()
+    for kmer in [reads[j][i:i + k] for i in range(len(reads[j]) - (k - 1))]:
+        if not kmer in khist:
+            khist[kmer] = []
+        else:
+            for read in set(khist[kmer]):
+                new_reads_overlaps.add(read)
+        khist[kmer].append(j)
+    new_reads_overlaps.discard(j)
+    for read in new_reads_overlaps:
+        try:
+            for pair in [(read, j), (j, read)]:
+                overlaps[pair] = suffixPrefixMatch(reads[pair[0]], reads[pair[1]], k)
+        except:
+            pass  # a deleted key probably
+
+    overlaps.pop((r1, r2), None)
+    for key in list(overlaps.keys()):
+        if key[0] in [r1, r2] or key[1] in [r1, r2]:
+            overlaps.pop(key)
+        elif key[0] in new_reads_overlaps and overlaps[key] < overlaps[(key[0], j)]:
+            overlaps.pop(key)
+    return (overlaps, khist)
+
+
+def greedy_scs(reads, khist, k):
+    """ Greedy shortest-common-superstring merge.
+        Repeat until no edges (overlaps of length >= k)
+        remain. """
+    reads = {e: v for e, v in enumerate(reads)}
+    j = len(reads)
+    overlaps = generate_overlaps(reads, khist, k)
+    read_a, read_b, olen = pick_maximal_overlap(overlaps)
+    while olen > 0:
+        merged = reads[read_a] + reads[read_b][-(len(reads[read_b]) - olen):]
+
+        reads.pop(read_a)
+        reads.pop(read_b)
+        reads[j] = merged
+        overlaps, khist = regenerate_overlaps(overlaps, read_a, read_b, j, reads, khist, k)
+        read_a, read_b, olen = pick_maximal_overlap(overlaps)
+        j += 1
+    return reads  # we do not join all reads into one contig, we leave them separated
+
+
+if __name__ == '__main__':
+    try:
+        from guppy import hpy
+
+        h = hpy()
+    except ImportError:
+        h = None
+
+    # get the input and output file
+    if len(sys.argv) >= 2:
+        input = sys.argv[1]
+        output = sys.argv[2]
+    else:
+        print("You did not provide input and output files")
+        sys.exit()
+    inputfile = open(input, 'r')
+    outputfile = open(output, 'w')
+
+    # read the reads and set K-mer length
+    K = 11
+    READS = read_fasta(inputfile)
+    readlen = len(READS[0])  # because we assume that they are all same length
+
+    # correct
+    KHIST = kmerHist(READS, K)
+    THRESH = hist2distr(KHIST)
+    corr_READS = set()
+    for read in READS:
+        corr_READS.add(correct1mm(read, K, KHIST, 'ACTG', THRESH))  # gets rid of duplicates from correction
+    corr_READS = list(corr_READS)
+    corr_khist = kmerHist(corr_READS, K)
+    corr_thresh = hist2distr(corr_khist)
+    READS = corr_READS  # because we do not need the old reads anymore
+    KHIST = corr_khist
+    numreads = len(READS)
+
+    # assemble the contigs
+    MIN_CONTIG_LENGTH = 300
+    contigs = greedy_scs(READS, KHIST, K)
+    for c in contigs.keys():
+        if len(contigs[c]) < MIN_CONTIG_LENGTH:  # we are interested only in those above the minimal length threshold
+            contigs.pop(c)
+
+    # and write them to file
+    for c, v in contigs.items():
+        outputfile.write('>' + str(c) + '\n' + contigs[c] + '\n')
+    outputfile.close()
+
+    # print memory usage
+    if h is not None:
+        hp = h.heap()
+        print("=======================================")
+        print("Used GB: ", float(hp.size) / float(1000000000))
